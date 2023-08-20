@@ -1,0 +1,1666 @@
+library(tidyr)
+library(statsr)
+library(ggplot2)
+library(nflfastR)
+library(pROC)
+library(patchwork)
+library(tictoc)
+library(nflreadr)
+library(nflplotR)
+library(nflverse)
+library(tidyverse)
+library(dplyr)
+
+seasons <- 1999:2022
+pbp_Original <- nflfastR::load_pbp(seasons)
+
+pbp_Original <- pbp_Original %>% 
+  mutate_at(vars(home_team, away_team, posteam, defteam, td_team, side_of_field), funs(case_when(
+    . %in% "JAC" ~ "JAX",
+    . %in% "STL" ~ "LAR",
+    . %in% "LA" ~ "LAR",
+    . %in% "SD" ~ "LAC",
+    . %in% "OAK" ~ "LV",
+    . %in% "ARZ" ~ "ARI",
+    . %in% "CLV" ~ "CLE",
+    TRUE ~ .
+  ))) 
+
+pbp_Original$play_id <- 1:nrow(pbp_Original)
+pbp <- pbp_Original
+rm(pbp_Original) # this is to conserve memory
+
+# INCORRECTLY LABELED TIMEOUT ERRORS HERE
+# View(pbp_Original %>% filter(timeout == 1 & play_type != "no_play" & !str_detect(desc, "(Challenge)") & !str_detect(desc, "(challenge)")))
+ShouldBeLabeledNoPlay <- pbp %>% filter(timeout == 1 & play_type != "no_play" 
+                                        & !str_detect(desc, "(Challenge)") & !str_detect(desc, "(challenge)") & str_detect(desc, "(Timeout)"))
+ShouldBeLabeledNoPlayVec <- ShouldBeLabeledNoPlay$play_id
+pbp[ShouldBeLabeledNoPlayVec, "play_type"] <- "no_play"
+rm(ShouldBeLabeledNoPlay)
+
+WronglyLabeledTimeout <- pbp %>% filter(timeout == 1 & play_type != "no_play" 
+                                        & !str_detect(desc, "(Challenge)") & !str_detect(desc, "(challenge)") & !str_detect(desc, "(Timeout)"))
+WronglyLabeledTimeoutVec <- WronglyLabeledTimeout$play_id
+pbp[WronglyLabeledTimeoutVec, "timeout"] <- 0
+rm(WronglyLabeledTimeout)
+
+WrongLabelPATAsNoPlay <-  pbp %>% filter(extra_point_attempt == 1 & play_type != "extra_point")
+WrongLabelPATAsNoPlayVec <- WrongLabelPATAsNoPlay$play_id
+pbp[WrongLabelPATAsNoPlayVec, "play_type"] <- "extra_point"
+rm(WrongLabelPATAsNoPlay)
+
+WrongLabelTwoMinWarning <- pbp %>% filter( ((!is.na(play_type)) | (!is.na(play_type_nfl))) &
+                                             ( (str_detect(desc, "(Two-Minute)")) |
+                                                 (str_detect(desc, "(Two-minute)")) |
+                                                 (str_detect(desc, "(Two Minute)")) |
+                                                 (str_detect(desc, "(Two minute)"))))
+WrongLabelTwoMinVec <- WrongLabelTwoMinWarning$play_id
+pbp[WrongLabelTwoMinVec, "play_type"] <- NA
+pbp[WrongLabelTwoMinVec, "play_type_nfl"] <- NA
+# This is why we avoid lower case t: View(pbp %>% filter((str_detect(desc, "(two minute)"))))
+rm(WrongLabelTwoMinWarning)
+
+# One fix to be made before creating Useless_NoSnap
+# View(pbp %>% filter(game_id == "2012_10_HOU_CHI", qtr == 2))
+pbp[637346, "play_type_nfl"] <- "PENALTY"
+pbp[637346, "penalty"] <- NA
+
+Useless_NoSnap <- pbp %>% 
+  filter( (penalty == 0 & 
+             (timeout > 0 & play_type == "no_play")) |
+            (is.na(play_type) & 
+               ((is.na(play_type_nfl) & !str_detect(desc, "(enforced)") & !str_detect(desc, "(Enforced)") & !str_detect(desc, "(ENFORCED)")) | 
+                  (play_type_nfl != "PENALTY" & play_type_nfl != "FREE_KICK" & play_type_nfl != "KICK_OFF" & 
+                     !str_detect(desc, "(enforced)") & !str_detect(desc, "(Enforced)") & !str_detect(desc, "(ENFORCED)")))) )
+Useless_NoSnap_Vec <- Useless_NoSnap$play_id
+# This DOES include declined pre-snap penalties, which are play_type_nfl == NA
+# Does NOT include all offsetting penalties (addressed way below)
+
+pbp <- pbp %>% filter(!play_id %in% Useless_NoSnap_Vec)
+pbp$play_id <- 1:nrow(pbp)
+rm(Useless_NoSnap)
+
+# Weird data entry errors (Recall: scrambles count as play_type == run, but sacks don't)
+# Scrambles and sacks both count as pass == 1
+WrongRunPassLabel <- pbp %>% filter(play_type == "run" & rush == 0 & pass == 0)
+WrongRunPassLabelID <- WrongRunPassLabel$play_id
+WrongRunPassLabel_Pass <- WrongRunPassLabel %>% 
+  filter(str_detect(desc, "(Back to pass)") | str_detect(desc, "(back to pass)"))
+WrongRunPassLabel_PassID <- WrongRunPassLabel_Pass$play_id
+pbp[WrongRunPassLabel_PassID, "pass"] <- 1
+WrongRunPassLabel_Rush <- WrongRunPassLabel %>% 
+  filter(!str_detect(desc, "(Back to pass)") & !str_detect(desc, "(back to pass)"))
+WrongRunPassLabel_RushID <- WrongRunPassLabel_Rush$play_id
+pbp[WrongRunPassLabel_RushID, "rush"] <- 1
+rm(WrongRunPassLabel, WrongRunPassLabel_Pass, WrongRunPassLabel_Rush)
+
+# This is empty, as it should be
+# View(pbp %>% filter(play_type == "pass" & rush == 0 & pass == 0))
+
+# Some data entry errors here:
+WronglyLabeledAsPunt <- pbp %>% filter(punt_attempt == 1 & 
+                                         !str_detect(desc, "(Punt)") & !str_detect(desc, "(punt)"))
+WronglyLabeledAsPuntVec <- WronglyLabeledAsPunt$play_id
+pbp[WronglyLabeledAsPuntVec, "punt_attempt"] <- 0
+# Fix the play_types manually
+# View(pbp %>% filter(game_id == "2000_06_WAS_PHI", qtr == 2)), 2 of final 3 plays of half
+pbp[56397:56398, "play_type"] <- "run"
+rm(WronglyLabeledAsPunt)
+
+WronglyLabeledAsFumLost <- pbp %>% filter(fumble_lost == 1 & !str_detect(desc, "(Fumble)") & 
+                                            !str_detect(desc, "(fumble)") & !str_detect(desc, "(FUMBLE)") &
+                                            !str_detect(desc, "(muff)") & !str_detect(desc, "(Muff)") &
+                                            !str_detect(desc, "(MUFF)") & !str_detect(desc, "(recover)") &
+                                            !str_detect(desc, "(Recover)") & !str_detect(desc, "(RECOVER)"))
+WronglyLabeledAsFumLostVec <- WronglyLabeledAsFumLost$play_id
+pbp[WronglyLabeledAsFumLostVec, "fumble_lost"] <- 0
+rm(WronglyLabeledAsFumLost)
+
+# A few egregious data entry errors here:
+WronglyLabeledAsFGAtt <- pbp %>% filter(field_goal_attempt == 1 & !str_detect(desc, "(goal)") & 
+                                          !str_detect(desc, "(Goal)") & !str_detect(desc, "(GOAL)"))
+WronglyLabeledAsFGAttVec <- WronglyLabeledAsFGAtt$play_id
+pbp[WronglyLabeledAsFGAttVec, "field_goal_attempt"] <- 0
+pbp[WronglyLabeledAsFGAttVec, "field_goal_result"] <- NA
+# Fix play_type, posteam manually
+# View(pbp %>% filter(game_id == "2000_11_OAK_DEN", qtr == 3)), 7-9 minutes left
+pbp[67714, "play_type"] <- "pass"
+pbp[67715, "play_type"] <- "run"
+pbp[67717, "play_type"] <- "kickoff"
+pbp[67714:67716, "posteam"] <- "DEN"
+pbp[67714:67716, "defteam"] <- "LV"
+pbp[67714:67716, "posteam_type"] <- "home"
+pbp[67714, "pass_attempt"] <- 1
+pbp[67715:67717, "pass_attempt"] <- 0
+pbp[67714, "pass"] <- 1
+pbp[67715:67717, "pass"] <- 0
+rm(WronglyLabeledAsFGAtt)
+
+# Weird one here, PAT that got blocked but recovered by offense for 2 pts
+# View(pbp %>% filter(game_id == "2020_04_CLE_DAL", qtr == 4, is.na(down)))
+pbp[924514, "play_type"] <- "extra_point"
+pbp[924514, "play_type_nfl"] <- "XP_KICK"
+pbp[924514, "rush"] <- 0
+pbp[924514, "play"] <- 0
+pbp[924514, "special"] <- 1
+pbp[924514, "extra_point_attempt"] <- 1
+pbp[924514, "two_point_attempt"] <- 0
+pbp[924514, "rush_attempt"] <- 0
+# Left extra_point_result as NA, two_point_conv_result as success, special_teams_play as 1
+
+WronglyLabeledAsKickoff <- pbp %>% filter(kickoff_attempt == 1 & !str_detect(desc, "(kick)") & 
+                                            !str_detect(desc, "(Kick)") & !str_detect(desc, "(KICK)"))
+WronglyLabeledAsKickoffVec <- WronglyLabeledAsKickoff$play_id
+pbp[WronglyLabeledAsKickoffVec, "kickoff_attempt"] <- 0
+rm(WronglyLabeledAsKickoff)
+
+ShouldBeLabeledAsKneel1 <- pbp %>% filter(play_type == "run" & ( (str_detect(desc, "(kneel)"))
+                                                                 | (str_detect(desc, "(Kneel)"))
+                                                                 | (str_detect(desc, "(KNEEL)"))
+                                                                 | (str_detect(desc, "(kNEEL)"))
+                                                                 | (str_detect(desc, "(takes a knee)"))
+                                                                 | (str_detect(desc, "(take a knee)"))
+                                                                 | (str_detect(desc, "(Takes a knee)")) 
+                                                                 | (str_detect(desc, "(Take a knee)"))
+                                                                 | (str_detect(desc, "(took a knee)"))
+                                                                 | (str_detect(desc, "(Took a knee)"))
+                                                                 | (str_detect(desc, "(took knee)"))
+                                                                 | (str_detect(desc, "(Took knee)"))
+                                                                 | (str_detect(desc, "(takes knee)"))
+                                                                 | (str_detect(desc, "(take knee)"))
+                                                                 | (str_detect(desc, "(Takes knee)")) 
+                                                                 | (str_detect(desc, "(Take knee)")) ))
+ShouldBeLabeledAsKneel1Vec <- ShouldBeLabeledAsKneel1$play_id
+pbp[ShouldBeLabeledAsKneel1Vec, "play_type"] <- "qb_kneel"
+pbp[ShouldBeLabeledAsKneel1Vec, "qb_kneel"] <- 1
+rm(ShouldBeLabeledAsKneel1)
+
+ShouldBeLabeledAsKneel2 <- pbp %>% filter(!is.na(down) & play == 1) %>%
+  filter(score_differential > 0 & score_differential < 9) %>%
+  filter(play_type == "run" & down == 3 & defteam_timeouts_remaining == 0 & game_seconds_remaining <= 40 & yards_gained < 1)
+ShouldBeLabeledAsKneel2Vec <- ShouldBeLabeledAsKneel2$play_id
+pbp[ShouldBeLabeledAsKneel2Vec, "play_type"] <- "qb_kneel"
+pbp[ShouldBeLabeledAsKneel2Vec, "qb_kneel"] <- 1
+rm(ShouldBeLabeledAsKneel2)
+
+# Kneeldown we can manually fix
+# View(pbp %>% filter(game_id == "1999_11_STL_SF", qtr == 4))
+pbp[25963, "play_type"] <- "qb_kneel"
+pbp[25963, "qb_kneel"] <- 1
+
+ShouldBeLabeledAsSpike <- pbp %>% filter(play_type == "pass" & 
+                                           ((str_detect(desc, "(spike)")) | (str_detect(desc, "(Spike)"))))
+ShouldBeLabeledAsSpikeVec <- ShouldBeLabeledAsSpike$play_id
+pbp[ShouldBeLabeledAsSpikeVec, "play_type"] <- "qb_spike"
+pbp[ShouldBeLabeledAsSpikeVec, "qb_spike"] <- 1
+rm(ShouldBeLabeledAsSpike)
+
+# Fix WPA mistakes for non-kneels
+# Note, this is empty: View(pbp %>% filter(is.na(wp) & is.na(home_wp) & play_type != "qb_kneel"))
+Wrong_WP_Label <- pbp %>% filter(is.na(wp) & !is.na(home_wp) & play_type != "qb_kneel")
+Wrong_WP_Label_ID <- Wrong_WP_Label$play_id
+Wrong_WP_Label_HomeTeamPos <- Wrong_WP_Label %>% filter(posteam == home_team)
+Wrong_WP_Label_HomeTeamPos_ID <- Wrong_WP_Label_HomeTeamPos$play_id
+pbp[Wrong_WP_Label_HomeTeamPos_ID, "wp"] <- pbp[Wrong_WP_Label_HomeTeamPos_ID, "home_wp"]
+pbp[Wrong_WP_Label_HomeTeamPos_ID, "def_wp"] <- 1 - (pbp[Wrong_WP_Label_HomeTeamPos_ID, "wp"])
+pbp[Wrong_WP_Label_HomeTeamPos_ID, "wpa"] <- 
+  pbp[Wrong_WP_Label_HomeTeamPos_ID, "home_wp_post"] - pbp[Wrong_WP_Label_HomeTeamPos_ID, "home_wp"]
+Wrong_WP_Label_AwayTeamPos <- Wrong_WP_Label %>% filter(posteam == away_team)
+Wrong_WP_Label_AwayTeamPos_ID <- Wrong_WP_Label_AwayTeamPos$play_id
+pbp[Wrong_WP_Label_AwayTeamPos_ID, "wp"] <- pbp[Wrong_WP_Label_AwayTeamPos_ID, "away_wp"]
+pbp[Wrong_WP_Label_AwayTeamPos_ID, "def_wp"] <- 1 - (pbp[Wrong_WP_Label_AwayTeamPos_ID, "wp"])
+pbp[Wrong_WP_Label_AwayTeamPos_ID, "wpa"] <- 
+  pbp[Wrong_WP_Label_AwayTeamPos_ID, "away_wp_post"] - pbp[Wrong_WP_Label_AwayTeamPos_ID, "away_wp"]
+# Test this out: View(pbp %>% filter(is.na(wp) & play_type != "qb_kneel"))
+rm(Wrong_WP_Label, Wrong_WP_Label_HomeTeamPos, Wrong_WP_Label_AwayTeamPos)
+
+# A few clock errors to fix
+# View(pbp %>% filter(game_id == "2010_19_SEA_CHI", qtr == 4)) 
+pbp[516415, "quarter_seconds_remaining"] <- 84
+pbp[516415, "half_seconds_remaining"] <- 84
+pbp[516415, "game_seconds_remaining"] <- 84
+
+# Some more clock fixes here
+# View(pbp %>% filter(game_id == "2007_19_NYG_DAL", qtr == 4))
+pbp[386497, "quarter_seconds_remaining"] <- 70
+pbp[386497, "half_seconds_remaining"] <- 70
+pbp[386497, "game_seconds_remaining"] <- 70
+pbp[386498, "quarter_seconds_remaining"] <- 40
+pbp[386498, "half_seconds_remaining"] <- 40
+pbp[386498, "game_seconds_remaining"] <- 40
+
+# View(pbp %>% filter(game_id == "2011_17_TEN_HOU", qtr == 4))
+pbp[559023, "quarter_seconds_remaining"] <- 69
+pbp[559023, "half_seconds_remaining"] <- 69
+pbp[559023, "game_seconds_remaining"] <- 69
+
+# View(pbp %>% filter(game_id == "2014_11_MIN_CHI", qtr == 4))
+pbp[676226, "quarter_seconds_remaining"] <- 134
+pbp[676226, "half_seconds_remaining"] <- 134
+pbp[676226, "game_seconds_remaining"] <- 134
+pbp[676229, "quarter_seconds_remaining"] <- 98
+pbp[676229, "half_seconds_remaining"] <- 98
+pbp[676229, "game_seconds_remaining"] <- 98
+pbp[676230, "quarter_seconds_remaining"] <- 78
+pbp[676230, "half_seconds_remaining"] <- 78
+pbp[676230, "game_seconds_remaining"] <- 78
+pbp[676231, "quarter_seconds_remaining"] <- 58
+pbp[676231, "half_seconds_remaining"] <- 58
+pbp[676231, "game_seconds_remaining"] <- 58
+
+# Couple of fourth down errors here:
+# View(pbp %>% filter(game_id == "2000_03_ATL_CAR", qtr == 3))
+pbp[47802, "play_type"] <- "pass"
+pbp[47802, "fourth_down_failed"] <- 1
+pbp[47802, "fixed_drive_result"] <- "Turnover on downs"
+pbp[47802, "series_result"] <- "Turnover on downs"
+# View(pbp %>% filter(game_id == "2000_09_TEN_WAS", qtr == 2))
+pbp[63297, "play_type"] <- "run"
+pbp[63297, "fourth_down_failed"] <- 1
+pbp[63297, "fixed_drive_result"] <- "Turnover on downs"
+pbp[63297, "series_result"] <- "Turnover on downs"
+
+# An error here:
+# View(pbp %>% filter(game_id == "2012_04_CLE_BAL", qtr == 4)), 2nd to last play of game
+pbp[569786, "fourth_down_failed"] <- 0
+
+# View(pbp %>% filter(game_id == "2018_01_ATL_PHI"))
+# 2nd to last play of game
+pbp[828163, "first_down_penalty"] <- 1
+pbp[828163, "first_down"] <- 1
+
+# View(pbp %>% filter(game_id == "2000_17_CIN_PHI", qtr == 4)), 0:49 is messed up play
+pbp[81302, "play_id"] <- 81289
+pbp[81289, "play_id"] <- 81290
+pbp[81290, "play_id"] <- 81291
+pbp[81291, "play_id"] <- 81292
+pbp[81292, "play_id"] <- 81293
+pbp[81293, "play_id"] <- 81294
+pbp[81294, "play_id"] <- 81295
+pbp[81295, "play_id"] <- 81296
+pbp[81296, "play_id"] <- 81297
+pbp[81297, "play_id"] <- 81298
+pbp[81298, "play_id"] <- 81299
+pbp[81299, "play_id"] <- 81300
+pbp[81300, "play_id"] <- 81301
+pbp[81301, "play_id"] <- 81302
+pbp <- arrange(pbp, play_id)
+
+# Get kneeldowns to standardize at pass == 0 and rush == 0
+AllKneeldowns <- pbp %>% filter(play_type == "qb_kneel")
+AllKneeldownsVec <- AllKneeldowns$play_id
+pbp[AllKneeldownsVec, "pass"] <- 0
+pbp[AllKneeldownsVec, "rush"] <- 0
+rm(AllKneeldowns)
+
+# These plays have play == 0 and special == 0, for some reason (ERRORS)
+IncorrectPlayLabel <- 
+  pbp %>% filter(!is.na(down) & play_type != "qb_kneel" & play_type != "qb_spike" &
+                   play == 0 & special == 0)
+# None of these plays are special teams
+IncorrectPlayLabelVec <- IncorrectPlayLabel$play_id
+pbp[IncorrectPlayLabelVec, "play"] <- 1
+rm(IncorrectPlayLabel)
+
+# However, these are all special teams
+IncorrectPlayLabel2 <- pbp %>% filter(special_teams_play == 1 & play == 1
+                                      & play_type != "run" & play_type != "pass")
+IncorrectPlayLabelVec2 <- IncorrectPlayLabel2$play_id
+pbp[IncorrectPlayLabelVec2, "special"] <- 1
+pbp[IncorrectPlayLabelVec2, "play"] <- 0
+rm(IncorrectPlayLabel2)
+
+# Some plays have special == 1 AND pass == 1 or rush == 1
+# First, manually fix the few errors from 2000
+IncorrectSpecialLabel_Pre2001 <- pbp %>% filter(season < 2001 & special == 1 & (pass == 1 | rush == 1))
+# View(pbp %>% filter(game_id == "2000_05_ATL_PHI", qtr == 4)), 6:42 left
+pbp[52309, "pass"] <- 0
+pbp[52309, "rush"] <- 0
+# View(pbp %>% filter(game_id == "2000_06_WAS_PHI", qtr == 2)), 3 of final 4 plays of half
+pbp[56396, "pass"] <- 0
+pbp[56396, "rush"] <- 0
+pbp[56397, "special"] <- 0
+pbp[56397, "play"] <- 1
+pbp[56398, "special"] <- 0
+pbp[56398, "play"] <- 1
+# View(pbp %>% filter(game_id == "2000_11_OAK_DEN", qtr == 3)), 7-9 minutes left
+pbp[67714, "special"] <- 0
+pbp[67714, "play"] <- 1
+pbp[67715, "special"] <- 0
+pbp[67715, "play"] <- 1
+pbp[67716, "pass"] <- 0
+pbp[67716, "rush"] <- 0
+pbp[67717, "pass"] <- 0
+pbp[67717, "rush"] <- 0
+rm(IncorrectSpecialLabel_Pre2001)
+
+# Now look at post-2001 for same plays
+IncorrectSpecialLabel_Since2001 <- pbp %>% filter(season >= 2001 & special == 1 & (pass == 1 | rush == 1))
+# Each of the XPs are easy errors to fix (i.e. no forward passes)
+IncorrectSpecialLabel_Since2001_XPs <- IncorrectSpecialLabel_Since2001 %>% 
+  filter(play_type %in% "extra_point")
+IncorrectSpecialLabel_Since2001_XPsVec <- IncorrectSpecialLabel_Since2001_XPs$play_id
+pbp[IncorrectSpecialLabel_Since2001_XPsVec, "pass"] <- 0
+pbp[IncorrectSpecialLabel_Since2001_XPsVec, "rush"] <- 0
+# Then fortunately, all of the "no_play" ones were NOT kick/punt attempts
+IncorrectSpecialLabel_Since2001_NoPlay <- IncorrectSpecialLabel_Since2001 %>% 
+  filter(play_type %in% "no_play")
+IncorrectSpecialLabel_Since2001_NoPlayVec <- IncorrectSpecialLabel_Since2001_NoPlay$play_id
+pbp[IncorrectSpecialLabel_Since2001_NoPlayVec, "special"] <- 0
+pbp[IncorrectSpecialLabel_Since2001_NoPlayVec, "play"] <- 1
+
+# For the rest, handle manually
+# For blocked kicks that also have forward passes, DON'T count the passes
+# View(pbp %>% filter(game_id == "2002_17_CAR_NO", qtr == 4)), 9:14 to go
+pbp[166770, "pass"] <- 0
+pbp[166770, "rush"] <- 0
+# View(pbp %>% filter(game_id == "2006_02_ARI_SEA", qtr == 2)), 10:47 to go
+pbp[303770, "pass"] <- 0
+pbp[303770, "rush"] <- 0
+# View(pbp %>% filter(game_id == "2012_15_GB_CHI", qtr == 4)), 8:11 to go
+pbp[596670, "pass"] <- 0
+pbp[596670, "rush"] <- 0
+# View(pbp %>% filter(game_id == "2013_05_NYJ_ATL", qtr == 1)), 11:46 to go
+pbp[617999, "pass"] <- 0
+pbp[617999, "rush"] <- 0
+# View(pbp %>% filter(game_id == "2016_17_JAX_IND", qtr == 4)), 2:00 to go
+pbp[781245, "pass"] <- 0
+pbp[781245, "rush"] <- 0
+rm(IncorrectSpecialLabel_Since2001, IncorrectSpecialLabel_Since2001_XPs, IncorrectSpecialLabel_Since2001_NoPlay)
+
+# These ones should have play == 0
+IncorrectPuntLabel <- pbp %>% filter(special == 0 & play_type != "pass" & play_type != "run" & 
+                                       (str_detect(pbp$desc, "(punts)") | str_detect(pbp$desc, "(Punts)") | 
+                                          str_detect(pbp$desc, "(punt is)") | str_detect(pbp$desc, "(Punt is)")))
+IncorrectPuntLabelID <- IncorrectPuntLabel$play_id
+pbp[IncorrectPuntLabelID, "special"] <- 1
+pbp[IncorrectPuntLabelID, "play"] <- 0
+rm(IncorrectPuntLabel)
+
+IncorrectFGLabel <- pbp %>% filter(play_type == "no_play" & special == 0 & 
+                                     !is.na(field_goal_result))
+IncorrectFGLabelID <- IncorrectFGLabel$play_id
+pbp[IncorrectFGLabelID, "special"] <- 1
+pbp[IncorrectFGLabelID, "play"] <- 0
+rm(IncorrectFGLabel)
+
+IncorrectPATLabel <- pbp %>% filter(play_type == "no_play" & special == 0 & 
+                                      !is.na(extra_point_result))
+IncorrectPATLabelID <- IncorrectPATLabel$play_id
+pbp[IncorrectPATLabelID, "special"] <- 1
+pbp[IncorrectPATLabelID, "play"] <- 0
+rm(IncorrectPATLabel)
+
+IncorrectPATLabel2 <- pbp %>% filter(is.na(play_type_nfl) & play_type == "extra_point")
+IncorrectPATLabelID2 <- IncorrectPATLabel2$play_id
+pbp[IncorrectPATLabelID2, "play_type_nfl"] <- "XP_KICK"
+rm(IncorrectPATLabel2)
+
+Incorrect2PtLabel <- pbp %>% filter(two_point_attempt == 1 & play == 0 & 
+                                      !str_detect(pbp$desc, "(Extra point)") & !str_detect(pbp$desc, "(extra point)"))
+Incorrect2PtLabelID <- Incorrect2PtLabel$play_id
+pbp[Incorrect2PtLabelID, "play"] <- 1
+pbp[Incorrect2PtLabelID, "special"] <- 0
+rm(Incorrect2PtLabel)
+
+Incorrect2PtLabelPass <- pbp %>% filter(two_point_attempt == 1 & penalty == 1 & pass_attempt == 1 & 
+                                          !str_detect(pbp$desc, "(Extra point)") & !str_detect(pbp$desc, "(extra point)"))
+Incorrect2PtLabelPassID <- Incorrect2PtLabelPass$play_id
+pbp[Incorrect2PtLabelPassID, "play_type"] <- "pass"
+rm(Incorrect2PtLabelPass)
+
+Incorrect2PtLabelRun <- pbp %>% filter(two_point_attempt == 1 & penalty == 1 & pass_attempt == 0 & 
+                                         !str_detect(pbp$desc, "(Extra point)") & !str_detect(pbp$desc, "(extra point)"))
+Incorrect2PtLabelRunID <- Incorrect2PtLabelRun$play_id
+pbp[Incorrect2PtLabelRunID, "play_type"] <- "run"
+rm(Incorrect2PtLabelRun)
+
+pbp <- pbp %>% group_by(game_id, game_half) %>% 
+  mutate(LastPlayOfHalf = as.numeric(play_id == max(play_id))) %>% 
+  ungroup()
+
+pbp <- pbp %>% group_by(game_id, game_half) %>% 
+  mutate(FirstPlayOfHalf = as.numeric(play_id == min(play_id))) %>% 
+  ungroup()
+
+pbp <- pbp %>% group_by(game_id) %>% 
+  mutate(FirstPlayOfGame = as.numeric(play_id == min(play_id))) %>% 
+  ungroup()
+
+pbp <- pbp %>% group_by(game_id) %>% 
+  mutate(LastPlayOfGame = as.numeric(play_id == max(play_id))) %>% 
+  ungroup()
+
+# Use LastPlayOfGame to fix EPA issues
+# View(pbp %>% filter(is.na(epa) & play_type != "qb_kneel"))
+# All are non-scoring and final play of game
+# But from there, split by the ones that do and don't have proper "ep" value
+Wrong_EPA_Label <- pbp %>% filter(is.na(epa) & play_type != "qb_kneel")
+Wrong_EPA_Label_CorrectEP <- Wrong_EPA_Label %>% filter(!is.na(ep))
+Wrong_EPA_Label_CorrectEP_ID <- Wrong_EPA_Label_CorrectEP$play_id
+pbp[Wrong_EPA_Label_CorrectEP_ID, "epa"] <- (-1 * pbp[Wrong_EPA_Label_CorrectEP_ID, "ep"])
+
+# This one did not have correct "ep"
+# View(pbp %>% filter(game_id == "2013_19_NO_SEA", qtr == 4))
+Wrong_EPA_Label_WrongEP <- Wrong_EPA_Label %>% filter(is.na(ep))
+Wrong_EPA_Label_WrongEP_ID <- Wrong_EPA_Label_WrongEP$play_id
+Wrong_EPA_Label_WrongEP_PriorPlay_ID <- Wrong_EPA_Label_WrongEP$play_id - 1
+pbp[Wrong_EPA_Label_WrongEP_ID, "ep"] <- (pbp[Wrong_EPA_Label_WrongEP_PriorPlay_ID, "ep"]) + (pbp[Wrong_EPA_Label_WrongEP_PriorPlay_ID, "epa"])
+pbp[Wrong_EPA_Label_WrongEP_ID, "epa"] <- (-1 * pbp[Wrong_EPA_Label_WrongEP_ID, "ep"])
+# Test this out: View(pbp %>% filter(is.na(epa) & play_type != "qb_kneel"))
+rm(Wrong_EPA_Label, Wrong_EPA_Label_CorrectEP, Wrong_EPA_Label_WrongEP)
+
+pbp <- pbp %>% mutate(posteam_win = 
+                        case_when(
+                          (result > 0 & posteam == home_team) | (result < 0 & posteam == away_team) ~ 1,
+                          (result < 0 & posteam == home_team) | ( result > 0 & posteam == away_team) ~ 0,
+                          result == 0 ~ 0.5))
+
+pbp <- pbp %>%
+  mutate(EndGamePtDiff = ifelse(posteam_type == "home", result, (-1 * result)))
+# Good way to test effectiveness:
+# View(pbp %>% filter(posteam_win == 1 & EndGamePtDiff < 0))
+
+QBPunts_Since2001 <- pbp %>% filter(play == 0 & season > 2000 & special_teams_play == 0 & play_type != "qb_kneel" & play_type != "qb_spike")
+QBPunts_Since2001_Vec <- QBPunts_Since2001$play_id
+pbp[QBPunts_Since2001_Vec, "special_teams_play"] <- 1
+rm(QBPunts_Since2001)
+
+# THESE ARE ISSUES THAT DON'T INCLUDE ONSIDE KICKS (or delay of game on kickoff, which are fixed below)
+AfterPATPenalty <- pbp %>% filter(posteam != lead(posteam), 
+                                  is.na(td_team), !str_detect(pbp$desc, "(onside)"), !str_detect(pbp$desc, "(Onside)"), !str_detect(pbp$desc, "(ONSIDE)"),
+                                  !str_detect(pbp$desc, "(recover)"), !str_detect(pbp$desc, "(Recover)"), !str_detect(pbp$desc, "(RECOVER)"), 
+                                  !str_detect(pbp$desc, "(Delay of Game)"), LastPlayOfDrive != TRUE, game_id == lead(game_id))
+AfterPATPenaltyVec <- AfterPATPenalty$play_id 
+rm(AfterPATPenalty)
+
+# Just remove those penalties (e.g. unsportsmanlike conduct after PAT)
+pbp <- pbp %>% filter(!play_id %in% AfterPATPenaltyVec)
+pbp$play_id <- 1:nrow(pbp)
+
+# More dealing with penalties after PATs
+# View(pbp %>% filter(posteam != lead(posteam), is.na(td_team), is.na(down), !play_type %in% "kickoff", LastPlayOfDrive != TRUE, game_id == lead(game_id)))
+# Make sure they are all actually penalties after PATs, no onside situations
+AfterPATPenalty2 <- pbp %>% 
+  filter(posteam != lead(posteam), is.na(td_team), is.na(down), !play_type %in% "kickoff", 
+         LastPlayOfDrive != TRUE, game_id == lead(game_id))
+AfterPATPenaltyVec2 <- AfterPATPenalty2$play_id 
+pbp <- pbp %>% filter(!play_id %in% AfterPATPenaltyVec2)
+pbp$play_id <- 1:nrow(pbp)
+rm(AfterPATPenalty2)
+
+AfterPATPenalty3 <- pbp %>% 
+  filter(lag(play_type) %in% "extra_point", lead(play_type) %in% "kickoff", 
+         !play_type %in% "kickoff")
+# View(AfterPATPenalty3 %>% filter(!str_detect(AfterPATPenalty3$desc, "(No Play)")))
+# This should be empty, meaining all of AfterPATPenalty3 is true No Plays
+AfterPATPenaltyVec3 <- AfterPATPenalty3$play_id 
+pbp <- pbp %>% filter(!play_id %in% AfterPATPenaltyVec3)
+pbp$play_id <- 1:nrow(pbp)
+rm(AfterPATPenalty3)
+
+# Create the "seconds elapsed" column for this project, and handle OT
+pbp_Regulation <- pbp %>% filter(qtr < 5)
+pbp_Regulation <- pbp_Regulation %>% group_by(game_id) %>% 
+  mutate(LastPlayOfRegulation = as.numeric(play_id == max(play_id))) %>% 
+  ungroup()
+LastPlayOfRegulation <- pbp_Regulation %>% filter(LastPlayOfRegulation == 1)
+LastPlayOfRegulation_ID <- LastPlayOfRegulation$play_id
+pbp_FirstOT <- pbp %>% filter(qtr == 5)
+pbp_FirstOT <- pbp_FirstOT %>% group_by(game_id) %>% 
+  mutate(LastPlayOfFirstOT = as.numeric(play_id == max(play_id))) %>% 
+  ungroup()
+LastPlayOfFirstOT <- pbp_FirstOT %>% filter(LastPlayOfFirstOT == 1)
+LastPlayOfFirstOT_ID <- LastPlayOfFirstOT$play_id
+
+pbp <- pbp %>% mutate(LastPlayOfRegulation = 0)
+pbp[LastPlayOfRegulation_ID, "LastPlayOfRegulation"] <- 1
+table(pbp$LastPlayOfRegulation)
+pbp <- pbp %>% mutate(LastPlayOfFirstOT = 0)
+pbp[LastPlayOfFirstOT_ID, "LastPlayOfFirstOT"] <- 1
+table(pbp$LastPlayOfFirstOT)
+# Then use case_when to account for overtimes and regulation
+pbp <- pbp %>% mutate(SecondsElapsed = 
+                        case_when(
+                          (LastPlayOfRegulation == 1 & LastPlayOfFirstOT == 0 & LastPlayOfGame == 0) ~ quarter_seconds_remaining,
+                          (LastPlayOfRegulation == 0 & LastPlayOfFirstOT == 0 & LastPlayOfGame == 0) ~ (game_seconds_remaining - lead(game_seconds_remaining)),
+                          (LastPlayOfRegulation == 1 & LastPlayOfFirstOT == 0 & LastPlayOfGame == 1) ~ game_seconds_remaining,
+                          (LastPlayOfRegulation == 0 & LastPlayOfFirstOT == 0 & LastPlayOfGame == 1) ~ 0,
+                          (LastPlayOfRegulation == 0 & LastPlayOfFirstOT == 1 & LastPlayOfGame == 0) ~ quarter_seconds_remaining,
+                          (LastPlayOfRegulation == 0 & LastPlayOfFirstOT == 1 & LastPlayOfGame == 1) ~ 0))
+# View(pbp %>% filter(season > 2000) %>% select(1:35, "SecondsElapsed") %>% arrange(desc(SecondsElapsed)))
+rm(pbp_Regulation, LastPlayOfRegulation, pbp_FirstOT, LastPlayOfFirstOT)
+
+Offsets <- pbp %>% filter((play_type_nfl == "PENALTY" & is.na(play_type)) |
+                            (str_detect(desc, "(No Play)") & (str_detect(desc, "(offset)"))) |
+                            (str_detect(desc, "(No Play)") & (str_detect(desc, "(Offset)"))) |
+                            (str_detect(desc, "(No play)") & (str_detect(desc, "(offset)"))) |
+                            (str_detect(desc, "(No play)") & (str_detect(desc, "(Offset)"))) |
+                            (str_detect(desc, "(no play)") & (str_detect(desc, "(offset)"))) |
+                            (str_detect(desc, "(no play)") & (str_detect(desc, "(Offset)"))))
+OffsetID <- Offsets$play_id
+pbp <- pbp %>% filter(!play_id %in% OffsetID)
+pbp$play_id <- 1:nrow(pbp)
+rm(Offsets)
+
+pbp_NoPATsOrSpecials <- pbp %>%
+  filter(!is.na(down) & extra_point_attempt == 0 & two_point_attempt == 0 & punt_attempt == 0 & field_goal_attempt == 0 &
+           (kickoff_attempt == 0 | (!str_detect(desc, "(kick)") & !str_detect(desc, "(Kick)") & !str_detect(desc, "(KICK)"))) 
+         & play_type != "extra_point" & play_type != "kickoff" & play_type != "qb_kneel" & play_type != "qb_spike")
+pbp_NoPATsOrSpecials <- pbp_NoPATsOrSpecials %>% filter(special == 0)
+# This does not include 2-pt conv: View(pbp_NoPATsOrSpecials %>% filter(two_point_attempt > 0))
+pbp_NoPATsOrSpecials <- pbp_NoPATsOrSpecials %>%
+  filter(pass == 1 | rush == 1)
+# This last step also excludes kneels/spikes
+
+# Fix any pass_oe errors; View(pbp_NoPATsOrSpecials %>% filter(season > 2005 & is.na(pass_oe)))
+pbp_NoPATsOrSpecials$play_id <- 1:nrow(pbp_NoPATsOrSpecials)
+WrongNALabel_PassOE <- pbp_NoPATsOrSpecials %>% filter(season > 2005 & is.na(pass_oe))
+WrongNALabel_PassOE_ID <- WrongNALabel_PassOE$play_id
+WrongNALabel_PassOE_Pass <- WrongNALabel_PassOE %>% 
+  filter(pass == 1)
+WrongNALabel_PassOE_PassID <- WrongNALabel_PassOE_Pass$play_id
+pbp_NoPATsOrSpecials[WrongNALabel_PassOE_PassID, "pass_oe"] <- 100 * (1 - pbp_NoPATsOrSpecials[WrongNALabel_PassOE_PassID, "xpass"])
+WrongNALabel_PassOE_Rush <- WrongNALabel_PassOE %>% 
+  filter(rush == 1)
+WrongNALabel_PassOE_RushID <- WrongNALabel_PassOE_Rush$play_id
+pbp_NoPATsOrSpecials[WrongNALabel_PassOE_RushID, "pass_oe"] <- (-100 * pbp_NoPATsOrSpecials[WrongNALabel_PassOE_RushID, "xpass"])
+pbp_NoPATsOrSpecials$play_id <- 1:nrow(pbp_NoPATsOrSpecials)
+rm(WrongNALabel_PassOE, WrongNALabel_PassOE_Pass, WrongNALabel_PassOE_Rush)
+
+# Fix plays that wrongly have NA in "success" column
+Success_NA_Label <- pbp_NoPATsOrSpecials %>% filter(is.na(success))
+Success_NA_Label_ID <- Success_NA_Label$play_id
+Success_NA_Label_ShouldBeSuccess <- Success_NA_Label %>% filter(epa > 0)
+Success_NA_Label_ShouldBeSuccess_ID <- Success_NA_Label_ShouldBeSuccess$play_id
+pbp_NoPATsOrSpecials[Success_NA_Label_ShouldBeSuccess_ID, "success"] <- 1
+Success_NA_Label_ShouldBeFailure <- Success_NA_Label %>% filter(epa <= 0)
+Success_NA_Label_ShouldBeFailure_ID <- Success_NA_Label_ShouldBeFailure$play_id
+pbp_NoPATsOrSpecials[Success_NA_Label_ShouldBeFailure_ID, "success"] <- 0
+rm(Success_NA_Label, Success_NA_Label_ShouldBeSuccess, Success_NA_Label_ShouldBeFailure)
+
+# Add a WP success column
+pbp_NoPATsOrSpecials <- pbp_NoPATsOrSpecials %>% mutate(WPSuccess = ifelse(wpa > 0, 1, 0))
+# Check for NAs: View(pbp_NoPATsOrSpecials %>% filter(is.na(WPSuccess)))
+
+# These are for if/when we want to make confidence intervals
+# Recall, Bernoulli is binary variable (i.e. use for proportions)
+SD_Bernoulli <- function(x){
+  mu <- mean(x, na.rm = TRUE)
+  return( sqrt( (mu*(1 - mu)) ))
+}
+
+SE_Bernoulli <- function(x){
+  mu <- mean(x, na.rm = TRUE)
+  return( sqrt( (mu*(1 - mu))/(length(x)) ) )
+}
+
+ConfBand_Bernoulli <- function(x) {
+  return(1.96*SE_Bernoulli(x))
+}
+
+upper_Bernoulli <- function(x) {
+  mean(x, na.rm = TRUE) + ConfBand_Bernoulli(x)
+}
+
+lower_Bernoulli <- function(x) {
+  mean(x, na.rm = TRUE) - ConfBand_Bernoulli(x)
+}
+
+# Make separate formula for continuous variables
+SE_Continuous <- function(x){
+  SD <- sd(x, na.rm = TRUE)
+  return( SD/sqrt((length(x))) )
+}
+
+ConfBand_Continuous <- function(x) {
+  return(1.96*SE_Continuous(x))
+}
+
+upper_Continuous <- function(x) {
+  mean(x, na.rm = TRUE) + ConfBand_Continuous(x)
+}
+
+lower_Continuous <- function(x) {
+  mean(x, na.rm = TRUE) - ConfBand_Continuous(x)
+}
+
+# First, let's take plays since 2006, so that we are in xpass era
+pbp_ProjectPlays <- pbp_NoPATsOrSpecials %>% filter(season > 2005)
+pbp_ProjectPlays$play_id <- 1:nrow(pbp_ProjectPlays)
+rm(pbp) 
+
+# Make it so no play has elapsed time of at least 60, by using NA
+# View(pbp_ProjectPlays %>% select(1:35, "SecondsElapsed") %>% arrange(desc(SecondsElapsed)))
+pbp_ProjectPlays <- pbp_ProjectPlays %>% 
+  mutate(SecElapsed = ifelse(SecondsElapsed >= 60, NA, SecondsElapsed))
+pbp_ProjectPlays <- pbp_ProjectPlays %>% select(-"SecondsElapsed")
+# View(pbp_ProjectPlays %>% filter(SecElapsed == 0) %>% select(1:35, "SecElapsed"))
+
+pbp_ProjectPlays <- pbp_ProjectPlays %>%
+  mutate(OffHasTO = ifelse(posteam_timeouts_remaining > 0, 1, 0))
+
+# Add verbal columns for graphs
+pbp_ProjectPlays <- pbp_ProjectPlays %>% mutate(IntendedPlayType =
+                                                  ifelse(pass == 1, "Dropback", "Designed Run"))
+pbp_ProjectPlays <- pbp_ProjectPlays %>% mutate(CATQtr =
+                                                  ifelse(qtr == 1, "1st Qtr", ifelse(
+                                                    qtr == 2, "2nd Qtr", ifelse(
+                                                      qtr == 3, "3rd Qtr", "4th Qtr/OT"))))
+
+pbp_ProjectPlays <- pbp_ProjectPlays %>% 
+  mutate(GRAPHTimeouts = case_when(posteam_timeouts_remaining == 0 ~ "Timeouts = 0",
+                                   posteam_timeouts_remaining == 1 ~ "Timeouts = 1",
+                                   posteam_timeouts_remaining == 2 ~ "Timeouts = 2",
+                                   posteam_timeouts_remaining == 3 ~ "Timeouts = 3"))
+
+pbp_ProjectPlays <- pbp_ProjectPlays %>% 
+  mutate(GRAPH_OffHasTO = ifelse(posteam_timeouts_remaining == 0, "No Timeouts", "Off Has TO"))
+
+pbp_ProjectPlays <- pbp_ProjectPlays %>% 
+  mutate(GRAPHDown = case_when(down == 1 ~ "1st Down",
+                               down == 2 ~ "2nd Down",
+                               down == 3 ~ "3rd Down",
+                               down == 4 ~ "4th Down"))
+
+# For this project, let's go with play intent (e.g. scrambles/sacks are passes)
+# And recall that in NFLFastR, QB scrambles and sacks both are pass == 1
+pbp_ProjPlays_IntendedPasses <- pbp_ProjectPlays %>% 
+  filter(pass == 1)
+pbp_ProjPlays_IntendedRushes <- pbp_ProjectPlays %>% 
+  filter(rush == 1)
+
+# Quick check that these have same amount
+nrow(pbp_ProjectPlays)
+nrow(pbp_ProjPlays_IntendedPasses) + nrow(pbp_ProjPlays_IntendedRushes)
+
+# Quick check that we have no absurd WPA outliers in either direction
+max(pbp_ProjectPlays$wpa)
+min(pbp_ProjectPlays$wpa)
+
+# Add the modifications for trailing late in the game
+ProjPlays_Trailing_Last2Min <- pbp_ProjectPlays %>% 
+  filter(score_differential <= -1 & score_differential >= -8 & game_seconds_remaining <= 120)
+# Add stratification for score diff, e.g. down by 4 and by 5 basically are same:
+ProjPlays_Trailing_Last2Min <- ProjPlays_Trailing_Last2Min %>%
+  mutate(Need_TD = ifelse(score_differential %in% -8:-4, 1, 0))
+
+ProjPlays_Trailing_Last2Min_Passes <- ProjPlays_Trailing_Last2Min %>% 
+  filter(pass == 1)
+ProjPlays_Trailing_Last2Min_Rushes <- ProjPlays_Trailing_Last2Min %>% 
+  filter(rush == 1)
+
+ProjPlays_Trailing_Last2Min_Passes_OffHasTO <- ProjPlays_Trailing_Last2Min_Passes %>%
+  filter(OffHasTO == 1)
+ProjPlays_Trailing_Last2Min_Passes_NoOffTO <- ProjPlays_Trailing_Last2Min_Passes %>%
+  filter(OffHasTO == 0)
+ProjPlays_Trailing_Last2Min_Rushes_OffHasTO <- ProjPlays_Trailing_Last2Min_Rushes %>%
+  filter(OffHasTO == 1)
+ProjPlays_Trailing_Last2Min_Rushes_NoOffTO <- ProjPlays_Trailing_Last2Min_Rushes %>%
+  filter(OffHasTO == 0)
+
+# Part 1: Look at how efficiency of play generally correlates with xpass
+# I.e., this focuses on entire football games, not just late situations
+
+# Here's correlation and r-squared for yards_gained and xpass on dropbacks
+# Very negative correlation with significant p-value
+cor(pbp_ProjPlays_IntendedPasses$yards_gained, pbp_ProjPlays_IntendedPasses$xpass)
+lm_YPPvsXPass_Dropbacks <- lm(pbp_ProjPlays_IntendedPasses$yards_gained ~ pbp_ProjPlays_IntendedPasses$xpass)
+summary(lm_YPPvsXPass_Dropbacks)
+rsquare(lm_YPPvsXPass_Dropbacks, pbp_ProjPlays_IntendedPasses)
+
+# Here's correlation and r-squared for epa and xpass on dropbacks
+# Slight negative correlation with significant p-value
+cor(pbp_ProjPlays_IntendedPasses$epa, pbp_ProjPlays_IntendedPasses$xpass)
+lm_EPAvsXPass_Dropbacks <- lm(pbp_ProjPlays_IntendedPasses$epa ~ pbp_ProjPlays_IntendedPasses$xpass)
+summary(lm_EPAvsXPass_Dropbacks)
+rsquare(lm_EPAvsXPass_Dropbacks, pbp_ProjPlays_IntendedPasses)
+
+# Here's correlation and r-squared for wpa and xpass on dropbacks
+# Almost no correlation
+cor(pbp_ProjPlays_IntendedPasses$wpa, pbp_ProjPlays_IntendedPasses$xpass)
+lm_WPAvsXPass_Dropbacks <- lm(pbp_ProjPlays_IntendedPasses$wpa ~ pbp_ProjPlays_IntendedPasses$xpass)
+summary(lm_WPAvsXPass_Dropbacks)
+rsquare(lm_WPAvsXPass_Dropbacks, pbp_ProjPlays_IntendedPasses)
+
+# Here's correlation and r-squared for yards_gained and xpass on Designed Runs
+# VERY POSITIVE CORRELATION, and significant p-value
+cor(pbp_ProjPlays_IntendedRushes$yards_gained, pbp_ProjPlays_IntendedRushes$xpass)
+lm_YPPvsXPass_DesignedRuns <- lm(pbp_ProjPlays_IntendedRushes$yards_gained ~ pbp_ProjPlays_IntendedRushes$xpass)
+summary(lm_YPPvsXPass_DesignedRuns)
+rsquare(lm_YPPvsXPass_DesignedRuns, pbp_ProjPlays_IntendedRushes)
+
+# Here's correlation and r-squared for epa and xpass on Designed Runs
+# SURPRISING NEGATIVE correlation with significant p-value
+cor(pbp_ProjPlays_IntendedRushes$epa, pbp_ProjPlays_IntendedRushes$xpass)
+lm_EPAvsXPass_DesignedRuns <- lm(pbp_ProjPlays_IntendedRushes$epa ~ pbp_ProjPlays_IntendedRushes$xpass)
+summary(lm_EPAvsXPass_DesignedRuns)
+rsquare(lm_EPAvsXPass_DesignedRuns, pbp_ProjPlays_IntendedRushes)
+
+# Here's correlation and r-squared for wpa and xpass on DesignedRuns
+# Extremely slight, but still interesting, negative correlation
+cor(pbp_ProjPlays_IntendedRushes$wpa, pbp_ProjPlays_IntendedRushes$xpass)
+lm_WPAvsXPass_DesignedRuns <- lm(pbp_ProjPlays_IntendedRushes$wpa ~ pbp_ProjPlays_IntendedRushes$xpass)
+summary(lm_WPAvsXPass_DesignedRuns)
+rsquare(lm_WPAvsXPass_DesignedRuns, pbp_ProjPlays_IntendedRushes)
+
+# Multiple response variables with both EPA and YPP for all rushes
+# VERY GOOD, shows contrast (more yards doesn't mean more EPA)
+ggplot(data = pbp_ProjPlays_IntendedRushes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained, color = "Yards/Play"),
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = epa, color = "EPA"),
+              method = "gam", se = T, span = 0.75) +
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "EPA and YPP vs. xpass (Expected Dropback Pct)",
+       subtitle = "Designed Runs from 2006-2022, incl. playoffs (n = 232405)",
+       caption = "Data from NFLFastR",
+       color = "Y-Axis by Color") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Multiple response variables with both WPA and YPP for all rushes, second axis/dual Y-axis
+# VERY GOOD contrast, shows that more yards doesn't mean more WPA
+ggplot(data = pbp_ProjPlays_IntendedRushes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa * 40), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/40), name="WPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "WPA and YPP vs. xpass (Expected Dropback Pct)",
+       subtitle = "Designed Runs from 2006-2022, incl. playoffs (n = 232405)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+# Explanation of how the above flat WPA one makes sense (wild)
+ggplot(data = pbp_ProjPlays_IntendedRushes) +
+  geom_point(aes(x = xpass, y = wpa), alpha = 0.1) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa),
+              method = "gam", se = T, span = 0.75) +
+  geom_abline(intercept = 0, slope = 0, color = "red") +
+  labs(x = "xpass (Expected Dropback Pct)", y = "WPA",
+       title = "WPA vs. xpass (Expected Dropback Pct) on Rushes",
+       subtitle = "Designed Runs from 2006-2022, incl. playoffs (n = 232405)",
+       caption = "Data from NFLFastR",
+       color = "Play Type") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Version of the immediately above plot, but with passes - still wild
+ggplot(data = pbp_ProjPlays_IntendedPasses) +
+  geom_point(aes(x = xpass, y = wpa), alpha = 0.1) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa),
+              method = "gam", se = T, span = 0.75) +
+  geom_abline(intercept = 0, slope = 0, color = "red") +
+  labs(x = "xpass (Expected Dropback Pct)", y = "WPA",
+       title = "WPA vs. xpass (Expected Dropback Pct)",
+       subtitle = "Dropbacks from 2006-2022, incl. playoffs (n = 362956)",
+       caption = "Data from NFLFastR",
+       color = "Play Type") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Multiple response variables AND facet-wrap on same plot for all plays
+# EPA and YPP vs xpass for runs and passes separately
+Plot1 <- ggplot(data = pbp_ProjPlays_IntendedRushes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = epa * 4), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/4), name="EPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "EPA and YPP vs. xpass",
+       subtitle = "Designed Runs from 2006-2022 (n = 232405)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot2 <- ggplot(data = pbp_ProjPlays_IntendedPasses) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = epa * 4), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/4), name="EPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "EPA and YPP vs. xpass",
+       subtitle = "Dropbacks from 2006-2022 (n = 362956)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot1 + Plot2
+
+# Then try it with a second axis/dual Y-axis with WPA and YPP, BETTER THAN EPA
+Plot3 <- ggplot(data = pbp_ProjPlays_IntendedRushes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa * 60), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/60), name="WPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "WPA and YPP vs. xpass",
+       subtitle = "Designed Runs from 2006-2022 (n = 232405)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot4 <- ggplot(data = pbp_ProjPlays_IntendedPasses) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa * 60), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/60), name="WPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "WPA and YPP vs. xpass",
+       subtitle = "Dropbacks from 2006-2022 (n = 362956)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot3 + Plot4
+
+# Part 2: The impact of time of the game
+# EPA and YPP vs. xpass for all 4th qtr/OT plays with sec.axis, pretty good
+Plot5 <- ggplot(data = pbp_ProjPlays_IntendedRushes_4thQtrOT) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = epa * 3), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/3), name="EPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "EPA and YPP vs. xpass in 4th Qtr/OT",
+       subtitle = "Designed Runs from 2006-2022, incl. playoffs (n = 59872)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot6 <- ggplot(data = pbp_ProjPlays_IntendedPasses_4thQtrOT) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = epa * 3), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/3), name="EPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "EPA and YPP vs. xpass in 4th Qtr/OT",
+       subtitle = "Dropbacks from 2006-2022, incl. playoffs (n = 102393)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot5 + Plot6
+
+# WPA and YPP vs. xpass for all 4th qtr/OT plays with sec.axis and + format, pretty good
+# Don't use a win rate one here, definitely way too correlated with the score
+Plot7 <- ggplot(data = pbp_ProjPlays_IntendedRushes_4thQtrOT) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa * 40), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/40), name="WPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "WPA and YPP vs. xpass in 4th Qtr/OT",
+       subtitle = "Designed Runs from 2006-2022, incl. playoffs (n = 59872)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot8 <- ggplot(data = pbp_ProjPlays_IntendedPasses_4thQtrOT) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa * 40), color = "red",
+              method = "gam", se = T, span = 0.75) + 
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/40), name="WPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "WPA and YPP vs. xpass in 4th Qtr/OT",
+       subtitle = "Dropbacks from 2006-2022, incl. playoffs (n = 102393)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot7 + Plot8
+
+# Throw in some of the r-squared calculations for 4th qtr specifically
+# Correlation and r-squared for yards_gained and xpass on Q4 dropbacks
+# Negative correlation, significant p-value
+cor(pbp_ProjPlays_IntendedPasses_4thQtrOT$yards_gained, pbp_ProjPlays_IntendedPasses_4thQtrOT$xpass)
+lm_YPPvsXPass_Dropbacks_4thQtrOT <- lm(pbp_ProjPlays_IntendedPasses_4thQtrOT$yards_gained ~ pbp_ProjPlays_IntendedPasses_4thQtrOT$xpass)
+summary(lm_YPPvsXPass_Dropbacks_4thQtrOT)
+rsquare(lm_YPPvsXPass_Dropbacks_4thQtrOT, pbp_ProjPlays_IntendedPasses_4thQtrOT)
+
+# Correlation and r-squared for epa and xpass on Q4 dropbacks
+# Negative correlation, significant p-value
+cor(pbp_ProjPlays_IntendedPasses_4thQtrOT$epa, pbp_ProjPlays_IntendedPasses_4thQtrOT$xpass)
+lm_EPAvsXPass_Dropbacks_4thQtrOT <- lm(pbp_ProjPlays_IntendedPasses_4thQtrOT$epa ~ pbp_ProjPlays_IntendedPasses_4thQtrOT$xpass)
+summary(lm_EPAvsXPass_Dropbacks_4thQtrOT)
+rsquare(lm_EPAvsXPass_Dropbacks_4thQtrOT, pbp_ProjPlays_IntendedPasses_4thQtrOT)
+
+# Correlation and r-squared for wpa and xpass on Q4 dropbacks
+# Slightly negative correlation, significant p-value
+cor(pbp_ProjPlays_IntendedPasses_4thQtrOT$wpa, pbp_ProjPlays_IntendedPasses_4thQtrOT$xpass)
+lm_WPAvsXPass_Dropbacks_4thQtrOT <- lm(pbp_ProjPlays_IntendedPasses_4thQtrOT$wpa ~ pbp_ProjPlays_IntendedPasses_4thQtrOT$xpass)
+summary(lm_WPAvsXPass_Dropbacks_4thQtrOT)
+rsquare(lm_WPAvsXPass_Dropbacks_4thQtrOT, pbp_ProjPlays_IntendedPasses_4thQtrOT)
+
+# Correlation and r-squared for yards_gained and xpass on Q4 DesignedRuns
+# VERY POSITIVE CORRELATION, and significant p-value
+cor(pbp_ProjPlays_IntendedRushes_4thQtrOT$yards_gained, pbp_ProjPlays_IntendedRushes_4thQtrOT$xpass)
+lm_YPPvsXPass_DesignedRuns_4thQtrOT <- lm(pbp_ProjPlays_IntendedRushes_4thQtrOT$yards_gained ~ pbp_ProjPlays_IntendedRushes_4thQtrOT$xpass)
+summary(lm_YPPvsXPass_DesignedRuns_4thQtrOT)
+rsquare(lm_YPPvsXPass_DesignedRuns_4thQtrOT, pbp_ProjPlays_IntendedRushes_4thQtrOT)
+
+# Correlation and r-squared for epa and xpass on Q4 DesignedRuns
+# Positive correlation, significant p-value
+cor(pbp_ProjPlays_IntendedRushes_4thQtrOT$epa, pbp_ProjPlays_IntendedRushes_4thQtrOT$xpass)
+lm_EPAvsXPass_DesignedRuns_4thQtrOT <- lm(pbp_ProjPlays_IntendedRushes_4thQtrOT$epa ~ pbp_ProjPlays_IntendedRushes_4thQtrOT$xpass)
+summary(lm_EPAvsXPass_DesignedRuns_4thQtrOT)
+rsquare(lm_EPAvsXPass_DesignedRuns_4thQtrOT, pbp_ProjPlays_IntendedRushes_4thQtrOT)
+
+# Correlation and r-squared for wpa and xpass on Q4 DesignedRuns
+# NOTABLY SLIGHTLY NEGATIVE CORRELATION, significant p-value
+cor(pbp_ProjPlays_IntendedRushes_4thQtrOT$wpa, pbp_ProjPlays_IntendedRushes_4thQtrOT$xpass)
+lm_WPAvsXPass_DesignedRuns_4thQtrOT <- lm(pbp_ProjPlays_IntendedRushes_4thQtrOT$wpa ~ pbp_ProjPlays_IntendedRushes_4thQtrOT$xpass)
+summary(lm_WPAvsXPass_DesignedRuns_4thQtrOT)
+rsquare(lm_WPAvsXPass_DesignedRuns_4thQtrOT, pbp_ProjPlays_IntendedRushes_4thQtrOT)
+
+# Now get into the graphs that involve score of game
+# Having multiple response variables with EPA and YPP for trailing plays
+# IN GENERAL, VERY GOOD to contrast EPA and yards_gained, mainly for rushes
+Plot9 <- ggplot(data = ProjPlays_Trailing_Last2Min_Rushes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = epa * 10), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/10), name="EPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "EPA and YPP vs. xpass, Offense Down by One Score",
+       subtitle = "Designed Runs, Last 2 Min, from 2006-2022 (n = 966)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot10 <- ggplot(data = ProjPlays_Trailing_Last2Min_Passes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = epa * 10), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-2, 8)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/10), name="EPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "EPA and YPP vs. xpass, Offense Down by One Score",
+       subtitle = "Dropbacks, Last 2 Min, from 2006-2022 (n = 9182)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot9 + Plot10
+
+# Explanation of how the above flat EPA for rushes one makes sense (wild)
+ggplot(data = ProjPlays_Trailing_Last2Min_Rushes) +
+  geom_point(aes(x = xpass, y = epa), alpha = 0.1) +
+  stat_smooth(mapping = aes(x = xpass, y = epa),
+              method = "gam", se = T, span = 0.75) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = "Expected Points Added",
+       title = "EPA vs. xpass (Expected Dropback Pct) on Rushes in Last 2 Min",
+       subtitle = "Offense Trailing by One Score from 2006-2022, incl. playoffs (n = 966)",
+       caption = "Data from NFLFastR",
+       color = "Play Type") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Using the corr can also help with that explanation
+# Showing very low r-squared between EPA and xpass for the trailing rushes
+cor(ProjPlays_Trailing_Last2Min_Rushes$epa, ProjPlays_Trailing_Last2Min_Rushes$xpass)
+lm_EPAvsXPass_TrailingRushes <- lm(ProjPlays_Trailing_Last2Min_Rushes$epa ~ ProjPlays_Trailing_Last2Min_Rushes$xpass)
+summary(lm_EPAvsXPass_TrailingRushes)
+rsquare(lm_EPAvsXPass_TrailingRushes, ProjPlays_Trailing_Last2Min_Rushes)
+
+# Version with WPA and YPP vs. xpass for all trailing plays, using second axis
+Plot11 <- ggplot(data = ProjPlays_Trailing_Last2Min_Rushes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa * 40), color = "red",
+              method = "gam", se = T, span = 0.75) +
+  coord_cartesian(ylim = c(-1, 9)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/40), name="WPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "WPA and YPP vs. xpass, Offense Down by One Score",
+       subtitle = "Designed Runs, Last 2 Min, 2006-2022 (n = 966)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot12 <- ggplot(data = ProjPlays_Trailing_Last2Min_Passes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa * 40), color = "red",
+              method = "gam", se = T, span = 0.75) + 
+  coord_cartesian(ylim = c(-1, 9)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/40), name="WPA/Play")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "WPA and YPP vs. xpass, Offense Down by One Score",
+       subtitle = "Dropbacks, Last 2 Min, 2006-2022 (n = 9182)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot11 + Plot12
+
+# Version of that with Win Rate used in place of WPA, use second axis
+Plot13 <- ggplot(data = ProjPlays_Trailing_Last2Min_Rushes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = posteam_win * 10), color = "red",
+              method = "gam", se = T, span = 0.75) + 
+  coord_cartesian(ylim = c(0, 10)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/10), name="Win Rate")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "Win Rate and YPP vs. xpass, Offense Down by One Score",
+       subtitle = "Designed Runs, Last 2 Min, 2006-2022 (n = 966)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 9.5, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot14 <- ggplot(data = ProjPlays_Trailing_Last2Min_Passes) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained), color = "blue",
+              method = "gam", se = T, span = 0.75) +
+  stat_smooth(mapping = aes(x = xpass, y = posteam_win * 10), color = "red",
+              method = "gam", se = T, span = 0.75) + 
+  coord_cartesian(ylim = c(0, 10)) +
+  scale_y_continuous(
+    # Second axis is the one that requires the scaling change
+    name = "Yards Per Play",
+    sec.axis = sec_axis(~.*(1/10), name="Win Rate")) + 
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = " ",
+       title = "Win Rate and YPP vs. xpass, Offense Down by One Score",
+       subtitle = "Dropbacks, Last 2 Min, 2006-2022 (n = 9182)",
+       caption = "Data from NFLFastR") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 9.5, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(color = "blue", size=10),
+        axis.title.y.right = element_text(color = "red", size=10))
+
+Plot13 + Plot14
+
+# Out of curiosity, see how many passes/runs came in low xpass situations
+# View(ProjPlays_Trailing_Last2Min_Rushes %>% filter(xpass < 0.5)); it's 271 / 966
+# View(ProjPlays_Trailing_Last2Min_Passes %>% filter(xpass < 0.5)); it's 105 / 9182
+
+# Showing very low r-squared between EPA and xpass for the trailing rushes
+# Could repeat this format for any of the other "wild" flat-looking plots
+cor(ProjPlays_Trailing_Last2Min_Rushes$epa, ProjPlays_Trailing_Last2Min_Rushes$xpass)
+lm_EPAvsXPass_TrailingRushes <- lm(ProjPlays_Trailing_Last2Min_Rushes$epa ~ ProjPlays_Trailing_Last2Min_Rushes$xpass)
+summary(lm_EPAvsXPass_TrailingRushes)
+rsquare(lm_EPAvsXPass_TrailingRushes, ProjPlays_Trailing_Last2Min_Rushes)
+
+# WPA vs. xpass for trailing plays, colored by play type (not as good as win rate)
+Plot15 <- ggplot(data = ProjPlays_Trailing_Last2Min) +
+  stat_smooth(mapping = aes(x = xpass, y = wpa, color = IntendedPlayType),
+              method = "gam", se = T, span = 0.75) +
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = "WPA",
+       title = "WPA vs. xpass (Expected Dropback Pct) in Last 2 Min",
+       subtitle = "Offense Trailing by One Score from 2006-2022, incl. playoffs (n = 10148)",
+       caption = "Data from NFLFastR",
+       color = "Play Type") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Win rate vs. xpass for trailing plays, colored by play type
+Plot16 <- ggplot(data = ProjPlays_Trailing_Last2Min) +
+  stat_smooth(mapping = aes(x = xpass, y = posteam_win, color = IntendedPlayType),
+              method = "gam", se = T, span = 0.75) +
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = "Win Rate",
+       title = "Eventual Win Rate vs. xpass in Last 2 Min",
+       subtitle = "Offense Trailing by One Score from 2006-2022 (n = 10148)",
+       caption = "Data from NFLFastR",
+       color = "Play Type") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+Plot17 <- ggplot(data = ProjPlays_Trailing_Last2Min) +
+  stat_smooth(mapping = aes(x = xpass, y = yards_gained, color = IntendedPlayType),
+              method = "gam", se = T, span = 0.75) +
+  # geom_abline(intercept = 0, slope = 0) +
+  labs(x = "xpass (Expected Dropback Pct)", y = "Yards Per Play",
+       title = "YPP vs. xpass in Last 2 Min",
+       subtitle = "Offense Trailing by One Score from 2006-2022 (n = 10148)",
+       caption = "Data from NFLFastR",
+       color = "Play Type") +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.69),
+        legend.position = "none") # this is because we don't need it for both 15 and 16
+
+Plot15
+Plot16
+Plot15 + Plot17
+Plot16 + Plot17
+
+# Incorporate t-tests
+# YPP for all passes vs runs
+t.test(pbp_ProjPlays_IntendedPasses$yards_gained, pbp_ProjPlays_IntendedRushes$yards_gained)
+# Shows significantly more YPP for passes, obviously
+# Just an example of a clearly significant t-test (would be similar for EPA, WPA, etc.)
+
+# YPP for late-game trailing passes vs runs
+t.test(ProjPlays_Trailing_Last2Min_Passes$yards_gained, ProjPlays_Trailing_Last2Min_Rushes$yards_gained)
+# Shows significantly more YPP for passes, obviously 
+# Just an example of a clearly significant t-test
+
+# epa for late-game trailing passes vs runs
+t.test(ProjPlays_Trailing_Last2Min_Passes$epa, ProjPlays_Trailing_Last2Min_Rushes$epa)
+# Shows NON-significant difference, with passes very slightly ahead
+
+# wpa for late-game trailing passes vs runs
+t.test(ProjPlays_Trailing_Last2Min_Passes$wpa, ProjPlays_Trailing_Last2Min_Rushes$wpa)
+# Non-significant difference between passes and runs, pretty surprising
+# Passes actually very slightly lower
+
+# Also repeat with trailing late in game vs all plays, for pass & rush separately
+# YPP for all passes vs late-game trailing passes
+t.test(pbp_ProjPlays_IntendedPasses$yards_gained, ProjPlays_Trailing_Last2Min_Passes$yards_gained)
+# Significant difference in favor of all passes, NOTABLE
+
+# EPA for all passes vs late-game trailing passes
+t.test(pbp_ProjPlays_IntendedPasses$epa, ProjPlays_Trailing_Last2Min_Passes$epa)
+# Significantly more EPA for all passes, NOTABLE
+
+# WPA for all passes vs late-game trailing passes
+t.test(pbp_ProjPlays_IntendedPasses$wpa, ProjPlays_Trailing_Last2Min_Passes$wpa)
+# Significantly more WPA for all passes, NOTABLE
+
+# YPP for all Rushes vs late-game trailing Rushes
+t.test(pbp_ProjPlays_IntendedRushes$yards_gained, ProjPlays_Trailing_Last2Min_Rushes$yards_gained)
+# Slightly significant difference in favor of all Rushes (surprising and NOTABLE)
+
+# EPA for all Rushes vs late-game trailing Rushes
+t.test(pbp_ProjPlays_IntendedRushes$epa, ProjPlays_Trailing_Last2Min_Rushes$epa)
+# Non-significant difference (very slightly higher EPA for all rushes)
+
+# WPA for all Rushes vs late-game trailing Rushes
+t.test(pbp_ProjPlays_IntendedRushes$wpa, ProjPlays_Trailing_Last2Min_Rushes$wpa)
+# Non-significant difference (very slightly higher WPA for all rushes)
+
+
+# Part 3: How to make the correct call (factor seconds elapsed, timeouts, etc.)
+# E.G. compare SecElapsed on rushes vs passes, then incorporate timeouts (OffHasTO)
+t.test(ProjPlays_Trailing_Last2Min_Passes$SecElapsed, ProjPlays_Trailing_Last2Min_Rushes$SecElapsed)
+# Obviously, significantly more seconds elapsed on rushes
+
+# Here is same comparison both with and without timeouts
+t.test(ProjPlays_Trailing_Last2Min_Passes_OffHasTO$SecElapsed, ProjPlays_Trailing_Last2Min_Rushes_OffHasTO$SecElapsed)
+# Even when offense has TO, still significantly more seconds elapsed on rushes
+
+t.test(ProjPlays_Trailing_Last2Min_Passes_NoOffTO$SecElapsed, ProjPlays_Trailing_Last2Min_Rushes_NoOffTO$SecElapsed)
+# As expected, more seconds elapsed on rushes when offense has no TO
+
+# Graph out the SecElapsed by play type and whether offense has TO
+SecElapsed_ByTO_Last2Min_CIVersion <- ProjPlays_Trailing_Last2Min %>%
+  group_by(IntendedPlayType, OffHasTO) %>%
+  summarize(n = n(), AvgSecElapsed = mean(SecElapsed),
+            LCI_Sec = lower_Continuous(SecElapsed), UCI_Sec = upper_Continuous(SecElapsed))
+# View(SecElapsed_ByTO_Last2Min_CIVersion)
+
+# This shows passes take fewer seconds than rushes, regardless of TO
+# Usable, particularly if/when needing to show that rushes take more time
+SecElapsed_ByTO_Last2Min_CIVersion %>%
+  ggplot(aes(x = OffHasTO, y = AvgSecElapsed, fill = IntendedPlayType)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Does Offense Have TO?", y = "Avg Sec Elapsed Before Next Play",
+       title = "Avg Sec Elapsed in Last 2 Min, by Play Type and Offensive TO",
+       subtitle = "2006-2022; Offense Trailing by One Possession (n = 10148)",
+       caption = "Data from nflfastR",
+       fill = "Intended Play Type") +
+  theme_bw() +
+  geom_errorbar(aes(ymin = LCI_Sec, ymax = UCI_Sec), position = "dodge") +
+  theme(plot.title = element_text(size = 10, hjust = 0.4),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Look at cor b/w YPP and SecElapsed for all trailing plays, and each play type
+cor(ProjPlays_Trailing_Last2Min$SecElapsed, ProjPlays_Trailing_Last2Min$yards_gained)
+lm_SecvsYPP_Last2Min <- lm(ProjPlays_Trailing_Last2Min$SecElapsed ~ ProjPlays_Trailing_Last2Min$yards_gained)
+summary(lm_SecvsYPP_Last2Min)
+rsquare(lm_SecvsYPP_Last2Min, ProjPlays_Trailing_Last2Min)
+# Slight, but significant, positive correlation
+
+cor(ProjPlays_Trailing_Last2Min_Passes$SecElapsed, ProjPlays_Trailing_Last2Min_Passes$yards_gained)
+lm_SecvsYPP_Last2Min_Passes <- lm(ProjPlays_Trailing_Last2Min_Passes$SecElapsed ~ ProjPlays_Trailing_Last2Min_Passes$yards_gained)
+summary(lm_SecvsYPP_Last2Min_Passes)
+rsquare(lm_SecvsYPP_Last2Min_Passes, ProjPlays_Trailing_Last2Min_Passes)
+# More positive correlation for passes
+
+cor(ProjPlays_Trailing_Last2Min_Rushes$SecElapsed, ProjPlays_Trailing_Last2Min_Rushes$yards_gained)
+lm_SecvsYPP_Last2Min_Rushes <- lm(ProjPlays_Trailing_Last2Min_Rushes$SecElapsed ~ ProjPlays_Trailing_Last2Min_Rushes$yards_gained)
+summary(lm_SecvsYPP_Last2Min_Rushes)
+rsquare(lm_SecvsYPP_Last2Min_Rushes, ProjPlays_Trailing_Last2Min_Rushes)
+# Nearly zero correlation b/w SecElapsed and YPP for trailing rushes
+
+# Make barplots with win rate (C.I. are way too wide for WPA version)
+ProjPlays_Trailing_Last2Min <- ProjPlays_Trailing_Last2Min %>%
+  mutate(RoughXPass = ifelse(xpass <= 0.50, "0-0.50", ifelse(
+    xpass > 0.50 & xpass <= 0.75, "0.50-0.75", ifelse(
+      xpass > 0.75 & xpass <= 0.90, "0.75-0.90", "0.90-1"))))
+
+WinRate_Trailing_Last2Min_ByXPass <- ProjPlays_Trailing_Last2Min %>%
+  group_by(IntendedPlayType, RoughXPass) %>%
+  summarize(n = n(), WinRate = mean(posteam_win),
+            LCI_Win = ifelse(lower_Bernoulli(posteam_win) >= 0, lower_Bernoulli(posteam_win), 0), 
+            UCI_Win = ifelse(upper_Bernoulli(posteam_win) <= 1, upper_Bernoulli(posteam_win), 1))
+# View(WinRate_Trailing_Last2Min_ByXPass)
+# sum(WinRate_Trailing_Last2Min_ByXPass$n)
+
+# For what it's worth, here's rate of 2-min plays with xpass of 0.8+ and 0.9+
+ProjPlays_Trailing_Last2Min_80PlusXPass <- ProjPlays_Trailing_Last2Min %>% filter(xpass >= 0.8)
+ProjPlays_Trailing_Last2Min_90PlusXPass <- ProjPlays_Trailing_Last2Min %>% filter(xpass >= 0.9)
+nrow(ProjPlays_Trailing_Last2Min_80PlusXPass) / nrow(ProjPlays_Trailing_Last2Min) # 8888 total, rate 0.8758
+nrow(ProjPlays_Trailing_Last2Min_90PlusXPass) / nrow(ProjPlays_Trailing_Last2Min) # 7903 total, rate 0.7788
+# This means that 985 snaps, or 9.71%, have come between 0.8-0.9 xpass
+
+# Pretty good, runs have higher win rate than pass in all four xpass categories
+WinRate_Trailing_Last2Min_ByXPass %>%
+  ggplot(aes(x = RoughXPass, y = WinRate, fill = IntendedPlayType)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "xpass (Expected Dropback Pct)", y = "Win Rate",
+       title = "Eventual Win Rate in Final 2 Min, by Play Type and xpass",
+       subtitle = "2006-2022; Offense Trailing by One Possession (n = 10148)",
+       caption = "Data from nflfastR",
+       fill = "Play Type") +
+  geom_errorbar(aes(ymin = LCI_Win, ymax = UCI_Win), position = "dodge") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Now we take the top models and mutate them to bigger data set of all plays
+ExpectedWPA_Trailing_Last2Min_TopModel_Passes <- lm(wpa ~ poly(down + ydstogo + OffHasTO + game_seconds_remaining, 9, raw = T) - 1, 
+                                                    data = ProjPlays_Trailing_Last2Min_Passes)
+ExpectedWPA_Trailing_Last2Min_Passes_Prediction <- predict(ExpectedWPA_Trailing_Last2Min_TopModel_Passes, 
+                                                           newdata = ProjPlays_Trailing_Last2Min)
+
+ExpectedWPA_Trailing_Last2Min_TopModel_Rushes <- lm(wpa ~ down + ydstogo + yardline_100 + OffHasTO + game_seconds_remaining - 1, 
+                                                    ProjPlays_Trailing_Last2Min_Rushes) 
+ExpectedWPA_Trailing_Last2Min_Rushes_Prediction <- predict(ExpectedWPA_Trailing_Last2Min_TopModel_Rushes, 
+                                                           newdata = ProjPlays_Trailing_Last2Min)
+
+ExpectedWinRate_Trailing_Last2Min_TopModel_Passes <- glm(posteam_win ~ down + ydstogo + yardline_100 + OffHasTO + game_seconds_remaining + Need_TD, 
+                                                         family = binomial, ProjPlays_Trailing_Last2Min_Passes) 
+ExpectedWinRate_Trailing_Last2Min_Passes_Prediction <- predict(ExpectedWinRate_Trailing_Last2Min_TopModel_Passes, 
+                                                               type = "response", newdata = ProjPlays_Trailing_Last2Min)
+
+ExpectedWinRate_Trailing_Last2Min_TopModel_Rushes <- glm(posteam_win ~ down + ydstogo + yardline_100 + OffHasTO + game_seconds_remaining + Need_TD, 
+                                                         family = binomial, ProjPlays_Trailing_Last2Min_Rushes) 
+ExpectedWinRate_Trailing_Last2Min_Rushes_Prediction <- predict(ExpectedWinRate_Trailing_Last2Min_TopModel_Rushes, 
+                                                               type = "response", newdata = ProjPlays_Trailing_Last2Min)
+
+ProjPlays_Trailing_Last2Min <- ProjPlays_Trailing_Last2Min %>%
+  mutate(ExpWPA_Pass = ExpectedWPA_Trailing_Last2Min_Passes_Prediction,
+         ExpWPA_Rush = ExpectedWPA_Trailing_Last2Min_Rushes_Prediction,
+         ExpWinRate_Pass = ExpectedWinRate_Trailing_Last2Min_Passes_Prediction,
+         ExpWinRate_Rush = ExpectedWinRate_Trailing_Last2Min_Rushes_Prediction)
+
+ProjPlays_Trailing_Last2Min <- ProjPlays_Trailing_Last2Min %>%
+  mutate(WPA_PassVsRun_PredictedGAP = (ExpWPA_Pass - ExpWPA_Rush))
+
+ProjPlays_Trailing_Last2Min <- ProjPlays_Trailing_Last2Min %>%
+  mutate(WPA_BetterType = ifelse(WPA_PassVsRun_PredictedGAP > 0, "Pass", "Rush"))
+
+ProjPlays_Trailing_Last2Min <- ProjPlays_Trailing_Last2Min %>%
+  mutate(WinRate_PassVsRun_PredictedGAP = (ExpWinRate_Pass - ExpWinRate_Rush))
+
+ProjPlays_Trailing_Last2Min <- ProjPlays_Trailing_Last2Min %>%
+  mutate(WinRate_BetterType = ifelse(WinRate_PassVsRun_PredictedGAP > 0, "Pass", "Rush"))
+
+table(ProjPlays_Trailing_Last2Min$WPA_BetterType)
+table(ProjPlays_Trailing_Last2Min$WinRate_BetterType)
+table(ProjPlays_Trailing_Last2Min$IntendedPlayType)
+# Shows how often coaches actually passed, and how often they should have
+
+# Turn that into its own data frame
+PlayType <- c("Pass", "Rush")
+RecTotal <- c(5823, 4325)
+RealTotal <- c(9182, 966)
+CoachesChoice_DF <- data.frame(PlayType, RecTotal, RealTotal)
+colnames(CoachesChoice_DF) <- c("Play Type", "Recommended Total", "Actual Total")
+
+# Compare accuracy of WPA models vs. WinRate (WinRate is better)
+summary(ExpectedWPA_Trailing_Last2Min_TopModel_Passes)
+summary(ExpectedWinRate_Trailing_Last2Min_TopModel_Passes)
+summary(ExpectedWPA_Trailing_Last2Min_TopModel_Rushes)
+summary(ExpectedWinRate_Trailing_Last2Min_TopModel_Rushes)
+
+# Example of using area under curve, or AUC, for model w/ passes & win rate
+WinRate_Passes_PredictionVsActual <- ProjPlays_Trailing_Last2Min %>%
+  filter(pass == 1) %>% select(posteam_win, ExpWinRate_Pass)
+# Builds roc for area under the curve
+roc_WinRate_Passes = multiclass.roc(WinRate_Passes_PredictionVsActual$posteam_win, WinRate_Passes_PredictionVsActual$ExpWinRate_Pass)
+# Produce area under the curve
+auc_WinRate_Passes = pROC::auc(roc_WinRate_Passes)
+# print(auc_WinRate_Passes); it's 0.711
+
+# For the sake of this project, don't include ties (simplest way to handle)
+WinRate_Passes_TruePositive <- WinRate_Passes_PredictionVsActual %>%
+  filter(posteam_win == 1 & ExpWinRate_Pass >= 0.5)
+WinRate_Passes_FalsePositive <- WinRate_Passes_PredictionVsActual %>%
+  filter(posteam_win == 0 & ExpWinRate_Pass >= 0.5)
+WinRate_Passes_TrueNegative <- WinRate_Passes_PredictionVsActual %>%
+  filter(posteam_win == 0 & ExpWinRate_Pass < 0.5)
+WinRate_Passes_FalseNegative <- WinRate_Passes_PredictionVsActual %>%
+  filter(posteam_win == 1 & ExpWinRate_Pass < 0.5)
+
+# Here's example of precision, which is (true pos / [true pos + false pos])
+WinRate_Passes_Precision <- 
+  nrow(WinRate_Passes_TruePositive) / (nrow(WinRate_Passes_TruePositive) + nrow(WinRate_Passes_FalsePositive))
+# it's 0.5758
+
+# Here's example of recall, which is (true pos / [true pos + false neg])
+WinRate_Passes_Recall <- 
+  nrow(WinRate_Passes_TruePositive) / (nrow(WinRate_Passes_TruePositive) + nrow(WinRate_Passes_FalseNegative))
+# it's 0.1446
+
+# Here's accuracy, which is ((true pos + true neg) / (sum of all four))
+WinRate_Passes_Accuracy <-
+  (nrow(WinRate_Passes_TruePositive) + nrow(WinRate_Passes_TrueNegative)) / 
+  (nrow(WinRate_Passes_TruePositive) + nrow(WinRate_Passes_TrueNegative) + nrow(WinRate_Passes_FalsePositive) + nrow(WinRate_Passes_FalseNegative))
+# it's 0.7677
+
+# Repeat those accuracy tests with model for win rate on designed runs
+WinRate_Rushes_PredictionVsActual <- ProjPlays_Trailing_Last2Min %>%
+  filter(pass == 0) %>% select(posteam_win, ExpWinRate_Rush)
+# Builds roc for area under the curve
+roc_WinRate_Rushes = multiclass.roc(WinRate_Rushes_PredictionVsActual$posteam_win, WinRate_Rushes_PredictionVsActual$ExpWinRate_Rush)
+# Produce area under the curve
+auc_WinRate_Rushes = pROC::auc(roc_WinRate_Rushes)
+# print(auc_WinRate_Rushes); it's 0.697
+
+# For the sake of this project, don't include ties (simplest way to handle)
+WinRate_Rushes_TruePositive <- WinRate_Rushes_PredictionVsActual %>%
+  filter(posteam_win == 1 & ExpWinRate_Rush >= 0.5)
+WinRate_Rushes_FalsePositive <- WinRate_Rushes_PredictionVsActual %>%
+  filter(posteam_win == 0 & ExpWinRate_Rush >= 0.5)
+WinRate_Rushes_TrueNegative <- WinRate_Rushes_PredictionVsActual %>%
+  filter(posteam_win == 0 & ExpWinRate_Rush < 0.5)
+WinRate_Rushes_FalseNegative <- WinRate_Rushes_PredictionVsActual %>%
+  filter(posteam_win == 1 & ExpWinRate_Rush < 0.5)
+
+# Here's example of precision, which is (true pos / [true pos + false pos])
+WinRate_Rushes_Precision <- 
+  nrow(WinRate_Rushes_TruePositive) / (nrow(WinRate_Rushes_TruePositive) + nrow(WinRate_Rushes_FalsePositive))
+# it's 0.6754
+
+# Here's example of recall, which is (true pos / [true pos + false neg])
+WinRate_Rushes_Recall <- 
+  nrow(WinRate_Rushes_TruePositive) / (nrow(WinRate_Rushes_TruePositive) + nrow(WinRate_Rushes_FalseNegative))
+# it's 0.6152
+
+# Here's accuracy, which is ((true pos + true neg) / (sum of all four))
+WinRate_Rushes_Accuracy <-
+  (nrow(WinRate_Rushes_TruePositive) + nrow(WinRate_Rushes_TrueNegative)) / 
+  (nrow(WinRate_Rushes_TruePositive) + nrow(WinRate_Rushes_TrueNegative) + nrow(WinRate_Rushes_FalsePositive) + nrow(WinRate_Rushes_FalseNegative))
+# it's 0.6726
+
+# Now show a few examples of WinRate model outputs for specific situations
+WinRate_Trailing_Last2Min_SamplePrediction_Pass <- predict(ExpectedWinRate_Trailing_Last2Min_TopModel_Passes, 
+                                                           newdata = data.frame("game_seconds_remaining" = c(20, 35, 40, 40, 70, 70, 55, 55, 105, 105),
+                                                                                "yardline_100" = c(85, 60, 80, 80, 45, 45, 50, 50, 45, 45), 
+                                                                                "OffHasTO" = c(0, 1, 1, 1, 1, 0, 1, 0, 0, 1),
+                                                                                "down" = c(3, 1, 1, 2, 3, 3, 2, 2, 2, 2),
+                                                                                "ydstogo" = c(4, 10, 10, 8, 2, 2, 6, 6, 1, 1),
+                                                                                "Need_TD" = c(1, 0, 0, 0, 1, 1, 1, 1, 0, 0)),
+                                                           type = "response")
+
+WinRate_Trailing_Last2Min_SamplePrediction_Rush <- predict(ExpectedWinRate_Trailing_Last2Min_TopModel_Rushes, 
+                                                           newdata = data.frame("game_seconds_remaining" = c(20, 35, 40, 40, 70, 70, 55, 55, 105, 105),
+                                                                                "yardline_100" = c(85, 60, 80, 80, 45, 45, 50, 50, 45, 45), 
+                                                                                "OffHasTO" = c(0, 1, 1, 1, 1, 0, 1, 0, 0, 1),
+                                                                                "down" = c(3, 1, 1, 2, 3, 3, 2, 2, 2, 2),
+                                                                                "ydstogo" = c(4, 10, 10, 8, 2, 2, 6, 6, 1, 1),
+                                                                                "Need_TD" = c(1, 0, 0, 0, 1, 1, 1, 1, 0, 0)),
+                                                           type = "response")
+
+WinRate_Trailing_PassVsRush_SampleDF <- cbind(data.frame("game_seconds_remaining" = c(20, 35, 40, 40, 70, 70, 55, 55, 105, 105),
+                                                         "yardline_100" = c(85, 60, 80, 80, 45, 45, 50, 50, 45, 45), 
+                                                         "OffHasTO" = c(0, 1, 1, 1, 1, 0, 1, 0, 0, 1),
+                                                         "down" = c(3, 1, 1, 2, 3, 3, 2, 2, 2, 2),
+                                                         "ydstogo" = c(4, 10, 10, 8, 2, 2, 6, 6, 1, 1),
+                                                         "Need_TD" = c(1, 0, 0, 0, 1, 1, 1, 1, 0, 0)),
+                                              "PredictedWinRate_Pass" = WinRate_Trailing_Last2Min_SamplePrediction_Pass,
+                                              "PredictedWinRate_Rush" = WinRate_Trailing_Last2Min_SamplePrediction_Rush)
+WinRate_Trailing_PassVsRush_SampleDF <- WinRate_Trailing_PassVsRush_SampleDF %>%
+  mutate(BetterPlay_WinRate = ifelse(PredictedWinRate_Pass > PredictedWinRate_Rush, "Pass", "Rush"))
+ScreenshotVersion_WinRate <- WinRate_Trailing_PassVsRush_SampleDF
+ScreenshotVersion_WinRate <- ScreenshotVersion_WinRate %>%
+  mutate(OffHasTO = ifelse(OffHasTO == 1, "Offense Has TO", "No Timeouts"))
+ScreenshotVersion_WinRate <- ScreenshotVersion_WinRate %>%
+  mutate(Need_TD = ifelse(Need_TD == 1, "Down By 4+", "Down By 1-3"))
+colnames(ScreenshotVersion_WinRate) <- c("Seconds Left", "Field Pos",
+                                         "Does Off Have TO?", "Down", "Distance", "Score Diff", 
+                                         "Expected Win Rate w/ Pass", "Expected Win Rate w/ Rush", "Optimal Choice")
+# View(ScreenshotVersion_WinRate)
+
+# Part 4: incorporate actual play-calling tendencies vs. xpass
+# I.e., look into question of whether coaches are calling it properly
+
+# This shows us how many runs/passes there were on each down in 2-minute drills, and their performance
+NumberOfPlays_Trailing_Last2Min_ByDownAndPlayType <- ProjPlays_Trailing_Last2Min %>%
+  group_by(IntendedPlayType, down) %>%
+  summarize(n = n(), WinRate = mean(posteam_win), AvgWPA = mean(wpa),
+            LCI_Win = ifelse(lower_Bernoulli(posteam_win) >= 0, lower_Bernoulli(posteam_win), 0), 
+            UCI_Win = ifelse(upper_Bernoulli(posteam_win) <= 1, upper_Bernoulli(posteam_win), 1),
+            LCI_WPA = lower_Continuous(wpa), UCI_WPA = upper_Continuous(wpa))
+# View(NumberOfPlays_Trailing_Last2Min_ByDownAndPlayType)
+
+# Set a cutoff at 20 for ydstogo (obvious pass situation beyond there)
+# Omit the extremes, e.g. goal-line situations and last play of game
+# AFTER building DF here, filter out rows where ydstogo > yardline_100
+Predictions_DF <- data.frame("game_seconds_remaining" = (rep(21:120, 28480)),
+                             "yardline_100" = rep(rep(11:99, each = 100), 320), 
+                             "OffHasTO" = rep(rep(0:1, each = 8900), 160),
+                             "down" = rep(rep(1:4, each = 17800), 40), 
+                             "ydstogo" = rep(rep(1:20, each = 71200), 2),
+                             "Need_TD" = (rep(0:1, each = 1424000)))
+Predictions_DF <- Predictions_DF %>% filter(yardline_100 >= ydstogo)
+
+WPA_Trailing_Last2Min_FullPrediction_Pass <- predict(ExpectedWPA_Trailing_Last2Min_TopModel_Passes, 
+                                                     newdata = Predictions_DF)
+
+WPA_Trailing_Last2Min_FullPrediction_Rush <- predict(ExpectedWPA_Trailing_Last2Min_TopModel_Rushes, 
+                                                     newdata = Predictions_DF)
+
+WinRate_Trailing_Last2Min_FullPrediction_Pass <- predict(ExpectedWinRate_Trailing_Last2Min_TopModel_Passes, 
+                                                         newdata = Predictions_DF,
+                                                         type = "response")
+
+WinRate_Trailing_Last2Min_FullPrediction_Rush <- predict(ExpectedWinRate_Trailing_Last2Min_TopModel_Rushes, 
+                                                         newdata = Predictions_DF,
+                                                         type = "response")
+
+Trailing_Last2Min_FullTestDF <- cbind(Predictions_DF,
+                                      "PredictedWPA_Pass" = WPA_Trailing_Last2Min_FullPrediction_Pass,
+                                      "PredictedWPA_Rush" = WPA_Trailing_Last2Min_FullPrediction_Rush,
+                                      "PredictedWinRate_Pass" = WinRate_Trailing_Last2Min_FullPrediction_Pass,
+                                      "PredictedWinRate_Rush" = WinRate_Trailing_Last2Min_FullPrediction_Rush)
+Trailing_Last2Min_FullTestDF <- Trailing_Last2Min_FullTestDF %>%
+  mutate(OffHasTO = ifelse(OffHasTO == 1, "Offense Has TO", "No Timeouts"))
+Trailing_Last2Min_FullTestDF <- Trailing_Last2Min_FullTestDF %>%
+  mutate(Need_TD = ifelse(Need_TD == 1, "Down By 4+", "Down By 1-3"))
+# View(Trailing_Last2Min_FullTestDF)
+rm(Predictions_DF)
+
+FullTestColNames <- c("Seconds Left", "Field Pos", "Does Off Have TO?", 
+                      "Down", "Distance", "Score Diff", "PredWPA_Pass", 
+                      "PredWPA_Rush", "PredWinRate_Pass", "PredWinRate_Rush")
+colnames(Trailing_Last2Min_FullTestDF) <- FullTestColNames
+
+Trailing_Last2Min_FullTestDF <- Trailing_Last2Min_FullTestDF %>% 
+  mutate(DesiredPlayType_WPA = ifelse(PredWPA_Pass > PredWPA_Rush, "Pass", "Rush"))
+
+Trailing_Last2Min_FullTestDF <- Trailing_Last2Min_FullTestDF %>% 
+  mutate(DesiredPlayType_WPA_Gradient = PredWPA_Pass - PredWPA_Rush)
+
+Trailing_Last2Min_FullTestDF <- Trailing_Last2Min_FullTestDF %>% 
+  mutate(DesiredPlayType_WinRate = ifelse(PredWinRate_Pass > PredWinRate_Rush, "Pass", "Rush"))
+
+Trailing_Last2Min_FullTestDF <- Trailing_Last2Min_FullTestDF %>% 
+  mutate(DesiredPlayType_WinRate_Gradient = PredWinRate_Pass - PredWinRate_Rush)
+
+Trailing_Last2Min_FullTestDF <- Trailing_Last2Min_FullTestDF %>% 
+  mutate(GRAPHDown = case_when(Down == 1 ~ "1st Down",
+                               Down == 2 ~ "2nd Down",
+                               Down == 3 ~ "3rd Down",
+                               Down == 4 ~ "4th Down"))
+
+# Make simplified plot with only first downs
+# In theory, more similar charts would cover all situations
+SimplifiedPlot_DF <- Trailing_Last2Min_FullTestDF %>% 
+  filter(Down == 1 & `Score Diff` == "Down By 4+")
+
+ggplot(data = SimplifiedPlot_DF) + 
+  geom_point(mapping = aes(x = `Field Pos`, y = `Seconds Left`, col = DesiredPlayType_WinRate)) +
+  facet_wrap(~`Does Off Have TO?`) +
+  theme_bw() +
+  scale_y_continuous(breaks = seq(20, 120, 25)) +
+  scale_x_continuous(breaks = seq(10, 100, 30)) +
+  labs(x = "Field Position", y = "Time Left (seconds)",
+       title = "What Should Offense Do on 1st Down?",
+       subtitle = "Based on Win Rate Model; Trailing by 4-8 Pts in Final 2 Min",
+       caption = "Data from nflfastR",
+       color = "Optimal Play Type") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# For the "what have coaches done?", keep the spotty version
+Simplified_CoachesRealChoices <- ProjPlays_Trailing_Last2Min %>%
+  filter(down == 1 & score_differential %in% -8:-4 & game_seconds_remaining > 20 & yardline_100 > 10)
+
+ggplot(data = Simplified_CoachesRealChoices) + 
+  geom_point(mapping = aes(x = yardline_100, y = game_seconds_remaining, col = IntendedPlayType), alpha = 0.75) +
+  facet_wrap(~GRAPH_OffHasTO) +
+  # scale_x_continuous(breaks = seq(0, 30, 10)) +
+  # coord_cartesian(xlim = c(0, 30)) +
+  theme_bw() +
+  labs(x = "Field Position", y = "Time Left (Seconds)",
+       title = "What Have Coaches Done On 1st Down?",
+       subtitle = "Last 2 Min, Trailing by 4-8 Pts, from 2006-2022 (n = 1983)",
+       caption = "Data from nflfastR",
+       color = "Intended Play Type") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
