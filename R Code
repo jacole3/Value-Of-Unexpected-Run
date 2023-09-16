@@ -1391,6 +1391,7 @@ WinRate_Trailing_Last2Min_ByXPass %>%
         plot.subtitle = element_text(size = 8, hjust = 0.5))
 
 # Now we take the top models and mutate them to bigger data set of all plays
+# The testing of the various weaker models is omitted here
 ExpectedWPA_Trailing_Last2Min_TopModel_Passes <- lm(wpa ~ poly(down + ydstogo + OffHasTO + game_seconds_remaining, 9, raw = T) - 1, 
                                                     data = ProjPlays_Trailing_Last2Min_Passes)
 ExpectedWPA_Trailing_Last2Min_Passes_Prediction <- predict(ExpectedWPA_Trailing_Last2Min_TopModel_Passes, 
